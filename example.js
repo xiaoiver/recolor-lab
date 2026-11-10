@@ -11,12 +11,74 @@ const storageKey='recolor-example-edits-v1';
 // Preserve this browser's edits when migrating the existing cached demo.
 const legacyStorageKey='recolor-edits:f82d0332053b4828afc6526275814a12';
 let sample,sequence,renderer,wheel,frame=-1,layerFrame=-1,layerKeys='',layers=[],ready=false,cycles=0,lastMediaTime=-1,lastTimeUI=0,outlineUntil=0,outlineEnabled=false;
+const localSam={worker:null,nextId:0,pending:new Map(),loaded:false,active:false,busy:false,masks:null,maskDims:null,scores:null,preview:false};
 const hasVideoFrames=typeof video.requestVideoFrameCallback==='function';
 const status=(text,error=false)=>{$('status').textContent=text;$('status').classList.toggle('error',error);};
 const safe=fn=>(...args)=>Promise.resolve().then(()=>fn(...args)).catch(error=>{status(error.message,true);console.error(error);});
 function label(id){return sample.labels[id]||`目标 ${id+1}`;}
 function persist(){try{sessionStorage.setItem(storageKey,JSON.stringify(edits.toJSON()));}catch{}}
 function time(value){return `${Math.floor((value||0)/60).toString().padStart(2,'0')}:${Math.floor((value||0)%60).toString().padStart(2,'0')}`;}
+function localSamStatus(text,error=false){$('local-sam-status').textContent=text;$('local-sam-status').classList.toggle('error',error);}
+function syncLocalPreview(){ $('local-mask').hidden=!(localSam.preview&&frame===0&&video.paused); }
+function samRequest(type,payload,transfer=[]){
+  if(!localSam.worker){
+    localSam.worker=new Worker('./sam2-worker.js',{type:'module'});
+    localSam.worker.onmessage=({data})=>{
+      if(data.type==='progress'){localSamStatus(data.stage);return;}
+      const request=localSam.pending.get(data.id);if(!request)return;
+      localSam.pending.delete(data.id);
+      if(data.type==='error')request.reject(Error(data.error));else request.resolve(data);
+    };
+    localSam.worker.onerror=event=>{for(const request of localSam.pending.values())request.reject(Error(event.message||'端侧 SAM Worker 已停止'));localSam.pending.clear();};
+  }
+  const id=++localSam.nextId;
+  return new Promise((resolve,reject)=>{localSam.pending.set(id,{resolve,reject});localSam.worker.postMessage({id,type,payload},transfer);});
+}
+function captureSamInput(){
+  const size=1024,canvas=document.createElement('canvas');canvas.width=size;canvas.height=size;
+  const context=canvas.getContext('2d',{willReadFrequently:true});context.drawImage(video,0,0,size,size);
+  const rgba=context.getImageData(0,0,size,size).data,pixels=new Float32Array(3*size*size),plane=size*size;
+  for(let p=0,i=0;p<plane;p++,i+=4){pixels[p]=rgba[i]/255;pixels[plane+p]=rgba[i+1]/255;pixels[plane*2+p]=rgba[i+2]/255;}
+  return {pixels,shape:[1,3,size,size]};
+}
+function seekStart(){
+  if(video.currentTime<.001&&!video.seeking)return Promise.resolve();
+  return new Promise((resolve,reject)=>{const done=()=>{video.removeEventListener('seeked',done);video.removeEventListener('error',fail);resolve();},fail=()=>{video.removeEventListener('seeked',done);reject(Error('无法回到视频首帧'));};video.addEventListener('seeked',done,{once:true});video.addEventListener('error',fail,{once:true});video.currentTime=0;});
+}
+function renderSamCandidate(index){
+  const masks=localSam.masks,dims=localSam.maskDims;if(!masks||!dims)return;
+  const count=dims[1]||1,height=dims[dims.length-2],width=dims[dims.length-1],plane=width*height,start=Math.min(index,count-1)*plane;
+  const source=document.createElement('canvas');source.width=width;source.height=height;
+  const image=source.getContext('2d').createImageData(width,height);
+  for(let p=0;p<plane;p++)if(masks[start+p]>0)image.data.set([61,229,206,130],p*4);
+  source.getContext('2d').putImageData(image,0,0);
+  const canvas=$('local-mask'),context=canvas.getContext('2d');context.clearRect(0,0,canvas.width,canvas.height);context.imageSmoothingEnabled=true;context.drawImage(source,0,0,canvas.width,canvas.height);
+  localSam.preview=true;syncLocalPreview();
+  for(const button of $('local-sam-candidates').children)button.setAttribute('aria-pressed',String(Number(button.dataset.index)===index));
+}
+function setSamCandidates(){
+  const holder=$('local-sam-candidates'),count=localSam.maskDims?.[1]||1;holder.replaceChildren();holder.hidden=false;
+  const scores=localSam.scores||[];let best=0;for(let index=1;index<count;index++)if((scores[index]??-Infinity)>(scores[best]??-Infinity))best=index;
+  for(let index=0;index<count;index++){const button=document.createElement('button');button.dataset.index=index;button.setAttribute('aria-pressed',String(index===best));button.textContent=`候选 ${index+1}${Number.isFinite(scores[index])?` · ${Math.round(scores[index]*100)}%`:''}`;button.onclick=()=>renderSamCandidate(index);holder.append(button);}
+  renderSamCandidate(best);
+}
+async function loadLocalSam(){
+  if(localSam.loaded)return;
+  localSam.busy=true;$('local-sam-load').disabled=true;localSamStatus('正在启动端侧 SAM 2…');
+  try{
+    const report=await samRequest('load');await seekStart();present(0);
+    const input=captureSamInput();await samRequest('encode',input,[input.pixels.buffer]);
+    localSam.loaded=true;$('local-sam-load').textContent=`已编码首帧（${report.device}）`;$('local-sam-mode').disabled=false;localSamStatus('首帧已编码。启用“使用本地点选”后，点击画面生成本地候选。');
+  }catch(error){$('local-sam-load').disabled=false;localSamStatus(error.message,true);throw error;}finally{localSam.busy=false;}
+}
+async function segmentLocalPoint(point){
+  if(!localSam.loaded){localSamStatus('请先加载并编码首帧。',true);return;}
+  if(localSam.busy)return;
+  localSam.busy=true;video.pause();await seekStart();present(0);
+  try{
+    const result=await samRequest('decode',{x:point.x*1024,y:point.y*1024});localSam.masks=result.masks;localSam.maskDims=result.maskDims;localSam.scores=result.scores;setSamCandidates();localSamStatus('已生成首帧候选。它只用于检查点选质量，尚未传播到后续帧或替换已有跟踪结果。');
+  }finally{localSam.busy=false;}
+}
 function syncControls(){
   $('editing-target').textContent=label(sequence.selectedId);$('hex').value=state.color.toUpperCase();$('color-preview').style.background=state.color;wheel.setColor(state.color);
   for(const [id,format] of [['amount',v=>`${Math.round(v*100)}%`],['lightness',v=>v.toFixed(2)],['threshold',v=>v.toFixed(2)]]){$(id).value=state[id];$(id+'-value').value=format(state[id]);}
@@ -44,7 +106,7 @@ function draw(){
 }
 function present(index){
   if(!ready||video.readyState<2||video.seeking)return;
-  frame=Math.min(sample.frame_count-1,Math.max(0,index));renderer.setFrame(video,sample.width,sample.height);draw();
+  frame=Math.min(sample.frame_count-1,Math.max(0,index));renderer.setFrame(video,sample.width,sample.height);draw();syncLocalPreview();
 }
 function observe(mediaTime){if(lastMediaTime>=0&&mediaTime+.001<lastMediaTime&&video.loop&&!video.paused&&lastMediaTime>video.duration-.25&&mediaTime<.25){cycles++;$('loop').dataset.cycles=String(cycles);}lastMediaTime=mediaTime;}
 function onVideoFrame(_,metadata){observe(metadata.mediaTime);present(Math.round(metadata.mediaTime*sample.fps));video.requestVideoFrameCallback(onVideoFrame);}
@@ -56,17 +118,18 @@ function tick(now){
   }
   requestAnimationFrame(tick);
 }
-$('output').onclick=safe(event=>{
+$('output').onclick=safe(async event=>{
   if(!ready||frame<0)return;
   const box=renderer.canvas.getBoundingClientRect(),scale=Math.min(box.width/sample.width,box.height/sample.height),w=sample.width*scale,h=sample.height*scale;
   const point={x:(event.clientX-box.left-(box.width-w)/2)/w,y:(event.clientY-box.top-(box.height-h)/2)/h};
   if(point.x<0||point.y<0||point.x>1||point.y>1)return;
+  if(localSam.active){await segmentLocalPoint(point);return;}
   const targets=[...sequence.ids].map(id=>({kind:'tracked',id,mask:sequence.maskForObject(frame,id)}));
   const hit=rankPointMasks(targets,sample.width,sample.height,point)[0];
   if(hit)select(hit.id);else status('此示例可编辑衬衫、外套和右侧柔光箱，请点目标内部。');
 });
 $('play').onclick=safe(async()=>{if(video.paused){if(video.ended)video.currentTime=0;await video.play();}else video.pause();});
-video.onplay=()=>{$('play').textContent='暂停';};video.onpause=()=>{$('play').textContent='播放';};video.onended=()=>{$('play').textContent='播放';};
+video.onplay=()=>{$('play').textContent='暂停';syncLocalPreview();};video.onpause=()=>{$('play').textContent='播放';syncLocalPreview();};video.onended=()=>{$('play').textContent='播放';syncLocalPreview();};
 $('loop').onclick=()=>{video.loop=!video.loop;$('loop').setAttribute('aria-pressed',String(video.loop));};
 $('seek').oninput=()=>{video.currentTime=Number($('seek').value);};video.addEventListener('seeked',()=>{if(!hasVideoFrames)present(Math.floor(video.currentTime*sample.fps));});
 $('hex').oninput=()=>{if(/^#[\da-f]{6}$/i.test($('hex').value))setColor($('hex').value);};$('hex').onchange=()=>{if(/^#[\da-f]{6}$/i.test($('hex').value))setColor($('hex').value);else{$('hex').value=state.color.toUpperCase();status('请输入 #RRGGBB 格式的颜色。',true);}};
@@ -74,6 +137,8 @@ for(const id of ['amount','lightness','threshold'])$(id).oninput=()=>{if(!ready)
 $('reset').onclick=()=>{if(!ready)return;edits.remove(sequence.selectedId);persist();select(sequence.selectedId,false);};
 $('reset-all').onclick=()=>{if(!ready)return;edits.clear();persist();select(sequence.selectedId,false);status('已还原所有目标的原色。');};
 $('toggle-outline').onclick=()=>{outlineEnabled=!outlineEnabled;$('toggle-outline').setAttribute('aria-pressed',String(outlineEnabled));outlineUntil=0;outline();};
+$('local-sam-load').onclick=safe(loadLocalSam);
+$('local-sam-mode').onclick=()=>{localSam.active=!localSam.active;$('local-sam-mode').setAttribute('aria-pressed',String(localSam.active));$('local-sam-mode').textContent=localSam.active?'本地点选已启用':'使用本地点选';localSamStatus(localSam.active?'请在视频上点选。页面会暂停在首帧并显示本地候选。':'已恢复使用已缓存的逐帧目标。');};
 const views={edit:0,split:1,mask:2,original:3};for(const button of document.querySelectorAll('[data-view]'))button.onclick=()=>{state.view=views[button.dataset.view];for(const item of document.querySelectorAll('[data-view]'))item.setAttribute('aria-pressed',String(item===button));$('split-controls').hidden=state.view!==1;draw();};
 $('split').oninput=()=>{state.split=Number($('split').value);$('split-value').value=`${Math.round(state.split*100)}%`;draw();};
 $('snapshot').onclick=safe(async()=>{draw();const blob=await new Promise(resolve=>renderer.canvas.toBlob(resolve,'image/png'));if(!blob)throw Error('当前画面无法保存');const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`recolor-example-${video.currentTime.toFixed(2)}.png`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);});
